@@ -2266,7 +2266,7 @@ mod timed_tests {
 
         let event_cache = client.event_cache();
 
-        // Don't forget to subscribe and like^W enable storage!
+        // Don't forget to subscribe and like.
         event_cache.subscribe().unwrap();
 
         client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
@@ -2343,7 +2343,7 @@ mod timed_tests {
 
         let event_cache = client.event_cache();
 
-        // Don't forget to subscribe and like^W enable storage!
+        // Don't forget to subscribe and like.
         event_cache.subscribe().unwrap();
 
         client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
@@ -2485,7 +2485,7 @@ mod timed_tests {
 
         let event_cache = client.event_cache();
 
-        // Don't forget to subscribe and like^W enable storage!
+        // Don't forget to subscribe and like.
         event_cache.subscribe().unwrap();
 
         client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
@@ -2633,7 +2633,7 @@ mod timed_tests {
 
         let event_cache = client.event_cache();
 
-        // Don't forget to subscribe and like^W enable storage!
+        // Don't forget to subscribe and like.
         event_cache.subscribe().unwrap();
 
         // Let's check whether the generic updates are received for the initialisation.
@@ -2757,7 +2757,7 @@ mod timed_tests {
 
         let event_cache = client.event_cache();
 
-        // Don't forget to subscribe and like^W enable storage!
+        // Don't forget to subscribe and like.
         event_cache.subscribe().unwrap();
 
         client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
