@@ -17,18 +17,22 @@
 
 use std::sync::{Arc, Weak};
 
+use as_variant::as_variant;
 use futures_core::Stream;
 use futures_util::{StreamExt, pin_mut};
 use matrix_sdk_base::{
-    crypto::{OlmMachine, store::types::RoomKeyInfo},
+    crypto::{store::types::RoomKeyInfo, types::events::room::encrypted::EncryptedEvent},
     deserialized_responses::{DecryptedRoomEvent, TimelineEvent, TimelineEventKind},
-    event_cache::store::{EventCacheStoreError, EventCacheStoreLock},
 };
 use matrix_sdk_common::executor::JoinHandle;
+use ruma::{RoomId, serde::Raw};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::warn;
 
-use crate::event_cache::{EventCacheError, RoomEventCacheState};
+use crate::{
+    Client,
+    event_cache::{EventCache, EventCacheError, EventCacheInner},
+};
 
 pub(crate) struct Redecryptor {
     redecryption_task: JoinHandle<()>,
@@ -42,8 +46,7 @@ impl Drop for Redecryptor {
 }
 
 pub(crate) struct InnerRedecryptor {
-    store: EventCacheStoreLock,
-    olm_machine: OlmMachine,
+    cache: Weak<EventCacheInner>,
 }
 
 impl InnerRedecryptor {
@@ -53,30 +56,42 @@ impl InnerRedecryptor {
         &self,
         room_key_info: RoomKeyInfo,
     ) -> Result<(), EventCacheError> {
-        let event_cache: RoomEventCacheState = unimplemented!();
+        let event_cache = EventCache { inner: self.cache.upgrade().unwrap() };
+        let client: Client = event_cache.inner.client.get().unwrap();
 
         // Load the relevant events from the event cache store and attempt to redecrypt
         // things.
-        // TODO: Do we want to have this method on the [`RoomEventCacheState`]?
-        let store = self.store.lock().await.unwrap();
+        let events = {
+            let store = event_cache.inner.store.lock().await.unwrap();
+            let events = store.get_room_events(&room_key_info.room_id).await?;
+
+            events
+        };
 
         // TODO: We can't load **all** events all the time.
-        let events = store.get_room_events(&room_key_info.room_id).await?;
+        let only_utd_events = |event: TimelineEvent| {
+            // We need the event ID and we only care about events that are still encrypted.
+            event.event_id().zip(
+                as_variant!(event.kind, TimelineEventKind::UnableToDecrypt { event, .. } => event),
+            )
+        };
 
-        for event in events.into_iter().filter(|e| !e.kind.is_utd()) {
-            let Some(event_id) = event.event_id() else {
+        let (room_cache, _) = event_cache.for_room(&room_key_info.room_id).await.unwrap();
+        let mut state = room_cache.inner.state.write().await;
+
+        for (event_id, event) in events.into_iter().filter_map(only_utd_events) {
+            let Some((location, mut target_event)) = state.find_event(&event_id).await? else {
                 continue;
             };
 
-            let Some((location, mut target_event)) = event_cache.find_event(&event_id).await?
-            else {
-                continue;
-            };
+            if let Some(decrypted) = self
+                .decrypt_event(&client, &room_key_info.room_id, event.cast_ref_unchecked())
+                .await
+            {
+                target_event.kind = TimelineEventKind::Decrypted(decrypted);
 
-            let decrypted = self.decrypt_event(event).await?;
-            target_event.kind = TimelineEventKind::Decrypted(decrypted);
-
-            event_cache.replace_event_at(location, target_event).await?
+                state.replace_event_at(location, target_event).await?
+            }
         }
 
         Ok(())
@@ -84,9 +99,20 @@ impl InnerRedecryptor {
 
     pub async fn decrypt_event(
         &self,
-        event: TimelineEvent,
-    ) -> Result<DecryptedRoomEvent, EventCacheStoreError> {
-        todo!();
+        client: &Client,
+        room_id: &RoomId,
+        event: &Raw<EncryptedEvent>,
+    ) -> Option<DecryptedRoomEvent> {
+        let machine = client.olm_machine().await;
+        let Some(machine) = &*machine else {
+            return None;
+        };
+
+        match machine.decrypt_room_event(event, room_id, client.decryption_settings()).await {
+            Ok(decrypted) => Some(decrypted),
+            // TODO: Inspect the error.
+            Err(e) => None,
+        }
     }
 
     pub async fn listen_for_room_keys_task(
