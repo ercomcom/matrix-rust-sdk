@@ -15,7 +15,7 @@
 //! The REDECRYPTOR is a layer that handles redecryption of events in case we
 //! couldn't decrypt them imediatelly
 
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 
 use as_variant::as_variant;
 use futures_core::Stream;
@@ -24,10 +24,11 @@ use matrix_sdk_base::{
     crypto::{store::types::RoomKeyInfo, types::events::room::encrypted::EncryptedEvent},
     deserialized_responses::{DecryptedRoomEvent, TimelineEvent, TimelineEventKind},
 };
-use matrix_sdk_common::executor::JoinHandle;
+use matrix_sdk_common::executor::spawn;
 use ruma::{RoomId, serde::Raw};
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tracing::warn;
+use tracing::{instrument, trace, warn};
 
 use crate::{
     Client,
@@ -35,58 +36,81 @@ use crate::{
 };
 
 pub(crate) struct Redecryptor {
-    redecryption_task: JoinHandle<()>,
-    inner: Arc<InnerRedecryptor>,
-}
-
-impl Drop for Redecryptor {
-    fn drop(&mut self) {
-        self.redecryption_task.abort();
-    }
-}
-
-pub(crate) struct InnerRedecryptor {
     cache: Weak<EventCacheInner>,
 }
 
-impl InnerRedecryptor {
+impl Redecryptor {
+    pub fn new(client: Client, cache: Weak<EventCacheInner>) -> JoinHandle<()> {
+        let redecryptor = Self { cache };
+
+        let task = spawn(async {
+            let stream = {
+                let machine = client.olm_machine().await;
+                machine.as_ref().unwrap().store().room_keys_received_stream()
+            };
+
+            drop(client);
+
+            redecryptor.listen_for_room_keys_task(stream).await;
+        });
+
+        task
+    }
     /// Attempt to redecrypt events after a room key with the given session ID
     /// has been received.
-    pub async fn retry_decryption(
+    #[instrument(skip_all, fields(room_key_info))]
+    async fn retry_decryption(
         &self,
+        cache: &EventCache,
         room_key_info: RoomKeyInfo,
     ) -> Result<(), EventCacheError> {
-        let event_cache = EventCache { inner: self.cache.upgrade().unwrap() };
-        let client: Client = event_cache.inner.client.get().unwrap();
+        trace!("Retrying to decrypt");
 
         // Load the relevant events from the event cache store and attempt to redecrypt
         // things.
         let events = {
-            let store = event_cache.inner.store.lock().await.unwrap();
+            // TODO: We can't load **all** events all the time.
+            let store = cache.inner.store.lock().await?;
             let events = store.get_room_events(&room_key_info.room_id).await?;
 
             events
         };
 
-        // TODO: We can't load **all** events all the time.
         let only_utd_events = |event: TimelineEvent| {
-            // We need the event ID and we only care about events that are still encrypted.
-            event.event_id().zip(
-                as_variant!(event.kind, TimelineEventKind::UnableToDecrypt { event, .. } => event),
-            )
+            // We need the event ID to be able to replace the event.
+            let event_id = event.event_id();
+            // We only care about events fort his particular room key, identified by the
+            // session ID.
+            let session_id = event.kind.session_id();
+
+            if session_id == Some(&room_key_info.session_id) {
+                // Only pick out events that are UTDs.
+                let event = as_variant!(event.kind, TimelineEventKind::UnableToDecrypt { event, .. } => event);
+                event.zip(event_id)
+            } else {
+                None
+            }
         };
 
-        let (room_cache, _) = event_cache.for_room(&room_key_info.room_id).await.unwrap();
+        // Get the cache for this particular room and lock the state for the duration of
+        // the decryption.
+        // TODO: Do we want to first decrypt and then do the locking and replacement,
+        // would be an additional loop but the lock would be free for the
+        // duration of the "slow" decryption attempts.
+        let (room_cache, _) = cache.for_room(&room_key_info.room_id).await?;
         let mut state = room_cache.inner.state.write().await;
 
-        for (event_id, event) in events.into_iter().filter_map(only_utd_events) {
+        for (event, event_id) in events.into_iter().filter_map(only_utd_events) {
+            // The event isn't in the cache, nothing to replace. Realistically this can't
+            // happen since we retrieved the list of events from the cache itself.
             let Some((location, mut target_event)) = state.find_event(&event_id).await? else {
                 continue;
             };
 
-            if let Some(decrypted) = self
-                .decrypt_event(&client, &room_key_info.room_id, event.cast_ref_unchecked())
-                .await
+            // If we managed to decrypt the event, and we should have to since we received
+            // the room key for this specific event, then replace the event.
+            if let Some(decrypted) =
+                self.decrypt_event(&cache, &room_key_info.room_id, event.cast_ref_unchecked()).await
             {
                 target_event.kind = TimelineEventKind::Decrypted(decrypted);
 
@@ -97,40 +121,44 @@ impl InnerRedecryptor {
         Ok(())
     }
 
-    pub async fn decrypt_event(
+    async fn decrypt_event(
         &self,
-        client: &Client,
+        cache: &EventCache,
         room_id: &RoomId,
         event: &Raw<EncryptedEvent>,
     ) -> Option<DecryptedRoomEvent> {
+        let client = cache.inner.client().ok()?;
         let machine = client.olm_machine().await;
-        let Some(machine) = &*machine else {
-            return None;
-        };
+        let machine = machine.as_ref()?;
 
         match machine.decrypt_room_event(event, room_id, client.decryption_settings()).await {
             Ok(decrypted) => Some(decrypted),
-            // TODO: Inspect the error.
-            Err(e) => None,
+            Err(e) => {
+                warn!("Failed to redecrypt an event {e:?}");
+                None
+            }
         }
     }
 
-    pub async fn listen_for_room_keys_task(
-        weak_redecryptor: Weak<InnerRedecryptor>,
+    async fn listen_for_room_keys_task(
+        self,
         received_stream: impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>>,
     ) {
         pin_mut!(received_stream);
 
-        // TODO: We need to relisten to this stream if it dies.
+        // TODO: We need to relisten to this stream if it dies due to the cross-process
+        // lock reloading the Olm machine.
         while let Some(update) = received_stream.next().await {
-            let Some(decryptor) = weak_redecryptor.upgrade() else {
-                break;
-            };
-
             if let Ok(room_keys) = update {
+                let Some(event_cache) = self.cache.upgrade() else {
+                    break;
+                };
+
+                let cache = EventCache { inner: event_cache };
+
                 for key in room_keys {
-                    let _ = decryptor
-                        .retry_decryption(key)
+                    let _ = self
+                        .retry_decryption(&cache, key)
                         .await
                         .inspect_err(|e| warn!("Error redecrypting {e:?}"));
                 }
