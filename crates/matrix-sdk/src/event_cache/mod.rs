@@ -69,6 +69,7 @@ use tracing::{Instrument as _, Span, debug, error, info, info_span, instrument, 
 use crate::{
     Client,
     client::WeakClient,
+    event_cache::redecryptor::Redecryptor,
     send_queue::{LocalEchoContent, RoomSendQueueUpdate, SendQueueUpdate},
 };
 
@@ -149,6 +150,9 @@ pub struct EventCacheDropHandles {
 
     /// The task used to automatically shrink the linked chunks.
     auto_shrink_linked_chunk_task: JoinHandle<()>,
+
+    /// The task used to automatically redecrypt UTDs.
+    redecryption_task: JoinHandle<()>,
 }
 
 impl fmt::Debug for EventCacheDropHandles {
@@ -162,6 +166,7 @@ impl Drop for EventCacheDropHandles {
         self.listen_updates_task.abort();
         self.ignore_user_list_update_task.abort();
         self.auto_shrink_linked_chunk_task.abort();
+        self.redecryption_task.abort();
     }
 }
 
@@ -258,10 +263,13 @@ impl EventCache {
                 auto_shrink_receiver,
             ));
 
+            let redecryption_task = Redecryptor::new(client, Arc::downgrade(&self.inner));
+
             Arc::new(EventCacheDropHandles {
                 listen_updates_task,
                 ignore_user_list_update_task,
                 auto_shrink_linked_chunk_task,
+                redecryption_task,
             })
         });
 
