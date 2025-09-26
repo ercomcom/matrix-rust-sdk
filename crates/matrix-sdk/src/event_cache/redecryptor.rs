@@ -32,7 +32,9 @@ use tracing::{info, instrument, trace, warn};
 
 use crate::{
     Client,
-    event_cache::{EventCache, EventCacheError, EventCacheInner},
+    event_cache::{
+        EventCache, EventCacheError, EventCacheInner, EventsOrigin, RoomEventCacheUpdate,
+    },
 };
 
 pub(crate) trait RedecryptorCtx {
@@ -57,16 +59,18 @@ impl RedecryptorCtx for EventCache {
         &self,
         room_key_info: &RoomKeyInfo,
     ) -> Result<Vec<(OwnedEventId, Raw<AnySyncTimelineEvent>)>, Self::Error> {
-        let only_utd_events = |event: TimelineEvent| {
-            // We need the event ID to be able to replace the event.
+        let filter_non_utds = |event: TimelineEvent| {
             let event_id = event.event_id();
             // We only care about events fort his particular room key, identified by the
             // session ID.
             let session_id = event.kind.session_id();
 
             if session_id == Some(&room_key_info.session_id) {
-                // Only pick out events that are UTDs.
+                // Only pick out events that are UTDs, get just the Raw event as this is what
+                // the OlmMachine needs.
                 let event = as_variant!(event.kind, TimelineEventKind::UnableToDecrypt { event, .. } => event);
+                // Zip the event ID and event together so we don't have to pick out the event ID
+                // again. We need the event ID to replace the event in the cache.
                 event_id.zip(event)
             } else {
                 None
@@ -80,9 +84,10 @@ impl RedecryptorCtx for EventCache {
         let store = self.inner.store.lock().await?;
         let events = store.get_room_events(&room_key_info.room_id).await?;
 
-        Ok(events.into_iter().filter_map(only_utd_events).collect())
+        Ok(events.into_iter().filter_map(filter_non_utds).collect())
     }
 
+    #[instrument(skip_all, fields(room_id))]
     async fn on_resolved_utds(
         &self,
         room_id: &RoomId,
@@ -93,14 +98,28 @@ impl RedecryptorCtx for EventCache {
         let (room_cache, _) = self.for_room(room_id).await?;
         let mut state = room_cache.inner.state.write().await;
 
+        let event_ids: Vec<_> = events.iter().map(|(event_id, _)| event_id).collect();
+
+        trace!(?event_ids, "Replacing successfully re-decrypted events");
+
         for (event_id, decrypted) in events {
             // The event isn't in the cache, nothing to replace. Realistically this can't
-            // happen since we retrieved the list of events from the cache itself.
+            // happen since we retrieved the list of events from the cache itself and
+            // `find_event()` will look into the store as well.
             if let Some((location, mut target_event)) = state.find_event(&event_id).await? {
                 target_event.kind = TimelineEventKind::Decrypted(decrypted);
                 state.replace_event_at(location, target_event).await?
             }
         }
+
+        // We replaced a bunch of events, reactive updates for those replacements have
+        // been queued up. We need to send them out to our subscribers now.
+        let diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
+
+        let _ = room_cache.inner.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
+            diffs,
+            origin: EventsOrigin::Cache,
+        });
 
         Ok(())
     }
@@ -168,7 +187,7 @@ impl Redecryptor {
         match machine.decrypt_room_event(event, room_id, client.decryption_settings()).await {
             Ok(decrypted) => Some(decrypted),
             Err(e) => {
-                warn!("Failed to redecrypt an event {e:?}");
+                warn!("Failed to redecrypt an event despite receiving a room key for it {e:?}");
                 None
             }
         }
