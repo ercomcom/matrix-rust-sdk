@@ -37,28 +37,11 @@ use crate::{
     },
 };
 
-pub(crate) trait RedecryptorCtx {
-    type Error;
-
+impl EventCache {
     async fn get_utds(
         &self,
         room_key_info: &RoomKeyInfo,
-    ) -> Result<Vec<(OwnedEventId, Raw<AnySyncTimelineEvent>)>, Self::Error>;
-
-    async fn on_resolved_utds(
-        &self,
-        room_id: &RoomId,
-        events: Vec<(OwnedEventId, DecryptedRoomEvent)>,
-    ) -> Result<(), Self::Error>;
-}
-
-impl RedecryptorCtx for EventCache {
-    type Error = EventCacheError;
-
-    async fn get_utds(
-        &self,
-        room_key_info: &RoomKeyInfo,
-    ) -> Result<Vec<(OwnedEventId, Raw<AnySyncTimelineEvent>)>, Self::Error> {
+    ) -> Result<Vec<(OwnedEventId, Raw<AnySyncTimelineEvent>)>, EventCacheError> {
         let filter_non_utds = |event: TimelineEvent| {
             let event_id = event.event_id();
             // We only care about events fort his particular room key, identified by the
@@ -92,7 +75,7 @@ impl RedecryptorCtx for EventCache {
         &self,
         room_id: &RoomId,
         events: Vec<(OwnedEventId, DecryptedRoomEvent)>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), EventCacheError> {
         // Get the cache for this particular room and lock the state for the duration of
         // the decryption.
         let (room_cache, _) = self.for_room(room_id).await?;
