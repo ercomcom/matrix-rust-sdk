@@ -262,7 +262,7 @@ impl EventCache {
                 auto_shrink_receiver,
             ));
 
-            let redecryptor = Redecryptor::new(client, Arc::downgrade(&self.inner));
+            let redecryptor = Redecryptor::new(Arc::downgrade(&self.inner));
 
             Arc::new(EventCacheDropHandles {
                 listen_updates_task,
