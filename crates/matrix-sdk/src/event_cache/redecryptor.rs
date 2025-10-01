@@ -106,7 +106,47 @@ impl EventCache {
 
         Ok(())
     }
-}
+
+    async fn decrypt_event(
+        &self,
+        room_id: &RoomId,
+        event: &Raw<EncryptedEvent>,
+    ) -> Option<DecryptedRoomEvent> {
+        let client = self.inner.client().ok()?;
+        let machine = client.olm_machine().await;
+        let machine = machine.as_ref()?;
+
+        match machine.decrypt_room_event(event, room_id, client.decryption_settings()).await {
+            Ok(decrypted) => Some(decrypted),
+            Err(e) => {
+                warn!("Failed to redecrypt an event despite receiving a room key for it {e:?}");
+                None
+            }
+        }
+    }
+    /// Attempt to redecrypt events after a room key with the given session ID
+    /// has been received.
+    #[instrument(skip_all, fields(room_key_info))]
+    async fn retry_decryption(&self, room_key_info: RoomKeyInfo) -> Result<(), EventCacheError> {
+        trace!("Retrying to decrypt");
+
+        let events = self.get_utds(&room_key_info).await?;
+        let mut decrypted_events = Vec::with_capacity(events.len());
+
+        for (event_id, event) in events {
+            // If we managed to decrypt the event, and we should have to since we received
+            // the room key for this specific event, then replace the event.
+            if let Some(decrypted) =
+                self.decrypt_event(&room_key_info.room_id, event.cast_ref_unchecked()).await
+            {
+                decrypted_events.push((event_id, decrypted));
+            }
+        }
+
+        self.on_resolved_utds(&room_key_info.room_id, decrypted_events).await?;
+
+        Ok(())
+    }
 
 pub(crate) struct Redecryptor {
     cache: Weak<EventCacheInner>,
@@ -129,52 +169,6 @@ impl Redecryptor {
 
         task
     }
-    /// Attempt to redecrypt events after a room key with the given session ID
-    /// has been received.
-    #[instrument(skip_all, fields(room_key_info))]
-    async fn retry_decryption(
-        &self,
-        cache: &EventCache,
-        room_key_info: RoomKeyInfo,
-    ) -> Result<(), EventCacheError> {
-        trace!("Retrying to decrypt");
-
-        let events = cache.get_utds(&room_key_info).await?;
-        let mut decrypted_events = Vec::with_capacity(events.len());
-
-        for (event_id, event) in events {
-            // If we managed to decrypt the event, and we should have to since we received
-            // the room key for this specific event, then replace the event.
-            if let Some(decrypted) =
-                self.decrypt_event(&cache, &room_key_info.room_id, event.cast_ref_unchecked()).await
-            {
-                decrypted_events.push((event_id, decrypted));
-            }
-        }
-
-        cache.on_resolved_utds(&room_key_info.room_id, decrypted_events).await?;
-
-        Ok(())
-    }
-
-    async fn decrypt_event(
-        &self,
-        cache: &EventCache,
-        room_id: &RoomId,
-        event: &Raw<EncryptedEvent>,
-    ) -> Option<DecryptedRoomEvent> {
-        let client = cache.inner.client().ok()?;
-        let machine = client.olm_machine().await;
-        let machine = machine.as_ref()?;
-
-        match machine.decrypt_room_event(event, room_id, client.decryption_settings()).await {
-            Ok(decrypted) => Some(decrypted),
-            Err(e) => {
-                warn!("Failed to redecrypt an event despite receiving a room key for it {e:?}");
-                None
-            }
-        }
-    }
 
     async fn listen_for_room_keys_task(
         self,
@@ -193,8 +187,8 @@ impl Redecryptor {
                 let cache = EventCache { inner: event_cache };
 
                 for key in room_keys {
-                    let _ = self
-                        .retry_decryption(&cache, key)
+                    let _ = cache
+                        .retry_decryption(key)
                         .await
                         .inspect_err(|e| warn!("Error redecrypting {e:?}"));
                 }
