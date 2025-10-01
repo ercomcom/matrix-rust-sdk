@@ -124,6 +124,7 @@ impl EventCache {
             }
         }
     }
+
     /// Attempt to redecrypt events after a room key with the given session ID
     /// has been received.
     #[instrument(skip_all, fields(room_key_info))]
@@ -147,15 +148,20 @@ impl EventCache {
 
         Ok(())
     }
+}
 
 pub(crate) struct Redecryptor {
-    cache: Weak<EventCacheInner>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for Redecryptor {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl Redecryptor {
-    pub fn new(client: Client, cache: Weak<EventCacheInner>) -> JoinHandle<()> {
-        let redecryptor = Self { cache };
-
+    pub fn new(client: Client, cache: Weak<EventCacheInner>) -> Self {
         let task = spawn(async {
             let stream = {
                 let machine = client.olm_machine().await;
@@ -164,14 +170,14 @@ impl Redecryptor {
 
             drop(client);
 
-            redecryptor.listen_for_room_keys_task(stream).await;
+            Self::listen_for_room_keys_task(cache, stream).await;
         });
 
-        task
+        Self { task }
     }
 
     async fn listen_for_room_keys_task(
-        self,
+        cache: Weak<EventCacheInner>,
         received_stream: impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>>,
     ) {
         pin_mut!(received_stream);
@@ -180,7 +186,7 @@ impl Redecryptor {
         // lock reloading the Olm machine.
         while let Some(update) = received_stream.next().await {
             if let Ok(room_keys) = update {
-                let Some(event_cache) = self.cache.upgrade() else {
+                let Some(event_cache) = cache.upgrade() else {
                     break;
                 };
 
