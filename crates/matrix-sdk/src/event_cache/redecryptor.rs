@@ -28,7 +28,7 @@ use matrix_sdk_common::executor::spawn;
 use ruma::{OwnedEventId, OwnedRoomId, RoomId, events::AnySyncTimelineEvent, serde::Raw};
 use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
 use tokio_stream::wrappers::{UnboundedReceiverStream, errors::BroadcastStreamRecvError};
-use tracing::{instrument, trace, warn};
+use tracing::{info, instrument, trace, warn};
 
 use crate::event_cache::{
     EventCache, EventCacheError, EventCacheInner, EventsOrigin, RoomEventCacheUpdate,
@@ -172,6 +172,7 @@ impl Drop for Redecryptor {
 impl Redecryptor {
     pub(super) fn new(cache: Weak<EventCacheInner>) -> Self {
         let (request_decryption_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+
         let task = spawn(async {
             let request_redecryption_stream = UnboundedReceiverStream::new(receiver);
 
@@ -198,7 +199,11 @@ impl Redecryptor {
         machine.as_ref().map(|m| m.store().room_keys_received_stream())
     }
 
-    async fn listen_loop(
+    fn upgrade_event_cache(cache: &Weak<EventCacheInner>) -> Option<EventCache> {
+        cache.upgrade().map(|inner| EventCache { inner })
+    }
+
+    async fn redecryption_loop(
         cache: &Weak<EventCacheInner>,
         decryption_request_stream: &mut Pin<&mut impl Stream<Item = DecryptionRetryRequest>>,
     ) -> bool {
@@ -208,17 +213,12 @@ impl Redecryptor {
 
         pin_mut!(room_key_stream);
 
-        // TODO: Listen to notifications that the Olm machine got recreated, this means
-        // that our room key stream is effectively dead, we need to exit this
-        // function with a `true` return value.
         loop {
             tokio::select! {
                 Some(request) = decryption_request_stream.next() => {
-                        let Some(event_cache) = cache.upgrade() else {
+                        let Some(cache) = Self::upgrade_event_cache(cache) else {
                             break false;
                         };
-
-                        let cache = EventCache { inner: event_cache };
 
                         for session_id in request.session_ids {
                             let _ = cache
@@ -227,22 +227,26 @@ impl Redecryptor {
                                 .inspect_err(|e| warn!("Error redecrypting {e:?}"));
                         }
                 }
-                Some(room_keys) = room_key_stream.next() => {
-                    if let Ok(room_keys) = room_keys {
-                        let Some(event_cache) = cache.upgrade() else {
-                            break false;
-                        };
+                room_keys = room_key_stream.next() => {
+                    match room_keys {
+                        Some(Ok(room_keys)) => {
+                            let Some(cache) = Self::upgrade_event_cache(cache) else {
+                                break false;
+                            };
 
-                        let cache = EventCache { inner: event_cache };
-
-                        for key in room_keys {
-                            let _ = cache
-                                .retry_decryption(&key.room_id, &key.session_id)
-                                .await
-                                .inspect_err(|e| warn!("Error redecrypting {e:?}"));
+                            for key in room_keys {
+                                let _ = cache
+                                    .retry_decryption(&key.room_id, &key.session_id)
+                                    .await
+                                    .inspect_err(|e| warn!("Error redecrypting {e:?}"));
+                            }
+                        },
+                        Some(Err(_)) => {
+                            todo!("Handle lagging here, how?")
+                        },
+                        None => {
+                            break true
                         }
-                    } else {
-                        todo!("Decrypt all events?");
                     }
                 }
                 else => break false,
@@ -256,9 +260,11 @@ impl Redecryptor {
     ) {
         pin_mut!(decryption_request_stream);
 
-        // TODO: We need to relisten to this stream if it dies due to the cross-process
-        // lock reloading the Olm machine.
-        while Self::listen_loop(&cache, &mut decryption_request_stream).await {}
+        while Self::redecryption_loop(&cache, &mut decryption_request_stream).await {
+            info!("Regenerating the re-decryption streams")
+        }
+
+        info!("Shutting down the event cache redecryptor");
     }
 }
 
@@ -389,6 +395,14 @@ mod tests {
         // Let us retrieve the captured event and to-device message.
         let event = event_receiver.await.expect("Alice should have sent the event by now");
         let room_key = room_key.await;
+
+        // We regenerate the Olm machine to check if the room key stream is recreated to
+        // correctly.
+        bob.inner
+            .base_client
+            .regenerate_olm(None)
+            .await
+            .expect("We should be able to regenerate the Olm machine");
 
         // Let us forward the event to Bob.
         matrix_mock_server
