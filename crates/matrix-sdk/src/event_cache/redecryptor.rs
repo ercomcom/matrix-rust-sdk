@@ -15,7 +15,7 @@
 //! The REDECRYPTOR is a layer that handles redecryption of events in case we
 //! couldn't decrypt them imediatelly
 
-use std::sync::Weak;
+use std::{collections::BTreeSet, pin::Pin, sync::Weak};
 
 use as_variant::as_variant;
 use futures_core::Stream;
@@ -25,30 +25,36 @@ use matrix_sdk_base::{
     deserialized_responses::{DecryptedRoomEvent, TimelineEvent, TimelineEventKind},
 };
 use matrix_sdk_common::executor::spawn;
-use ruma::{OwnedEventId, RoomId, events::AnySyncTimelineEvent, serde::Raw};
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tracing::{info, instrument, trace, warn};
+use ruma::{OwnedEventId, OwnedRoomId, RoomId, events::AnySyncTimelineEvent, serde::Raw};
+use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
+use tokio_stream::wrappers::{UnboundedReceiverStream, errors::BroadcastStreamRecvError};
+use tracing::{instrument, trace, warn};
 
-use crate::{
-    Client,
-    event_cache::{
-        EventCache, EventCacheError, EventCacheInner, EventsOrigin, RoomEventCacheUpdate,
-    },
+use crate::event_cache::{
+    EventCache, EventCacheError, EventCacheInner, EventsOrigin, RoomEventCacheUpdate,
 };
+
+/// The information sent across the channel to the long-running task requesting
+/// that the supplied set of sessions be retried.
+pub struct DecryptionRetryRequest {
+    room_id: OwnedRoomId,
+    session_ids: BTreeSet<String>,
+}
+
+type SessionId<'a> = &'a str;
 
 impl EventCache {
     async fn get_utds(
         &self,
-        room_key_info: &RoomKeyInfo,
+        room_id: &RoomId,
+        session_id: SessionId<'_>,
     ) -> Result<Vec<(OwnedEventId, Raw<AnySyncTimelineEvent>)>, EventCacheError> {
         let filter_non_utds = |event: TimelineEvent| {
             let event_id = event.event_id();
+
             // We only care about events fort his particular room key, identified by the
             // session ID.
-            let session_id = event.kind.session_id();
-
-            if session_id == Some(&room_key_info.session_id) {
+            if event.kind.session_id() == Some(session_id) {
                 // Only pick out events that are UTDs, get just the Raw event as this is what
                 // the OlmMachine needs.
                 let event = as_variant!(event.kind, TimelineEventKind::UnableToDecrypt { event, .. } => event);
@@ -65,7 +71,7 @@ impl EventCache {
         //
         // TODO: We can't load **all** events all the time.
         let store = self.inner.store.lock().await?;
-        let events = store.get_room_events(&room_key_info.room_id).await?;
+        let events = store.get_room_events(&room_id).await?;
 
         Ok(events.into_iter().filter_map(filter_non_utds).collect())
     }
@@ -128,29 +134,32 @@ impl EventCache {
     /// Attempt to redecrypt events after a room key with the given session ID
     /// has been received.
     #[instrument(skip_all, fields(room_key_info))]
-    async fn retry_decryption(&self, room_key_info: RoomKeyInfo) -> Result<(), EventCacheError> {
+    async fn retry_decryption(
+        &self,
+        room_id: &RoomId,
+        session_id: SessionId<'_>,
+    ) -> Result<(), EventCacheError> {
         trace!("Retrying to decrypt");
 
-        let events = self.get_utds(&room_key_info).await?;
+        let events = self.get_utds(room_id, session_id).await?;
         let mut decrypted_events = Vec::with_capacity(events.len());
 
         for (event_id, event) in events {
             // If we managed to decrypt the event, and we should have to since we received
             // the room key for this specific event, then replace the event.
-            if let Some(decrypted) =
-                self.decrypt_event(&room_key_info.room_id, event.cast_ref_unchecked()).await
-            {
+            if let Some(decrypted) = self.decrypt_event(room_id, event.cast_ref_unchecked()).await {
                 decrypted_events.push((event_id, decrypted));
             }
         }
 
-        self.on_resolved_utds(&room_key_info.room_id, decrypted_events).await?;
+        self.on_resolved_utds(room_id, decrypted_events).await?;
 
         Ok(())
     }
 }
 
 pub(crate) struct Redecryptor {
+    request_decryption_sender: UnboundedSender<DecryptionRetryRequest>,
     task: JoinHandle<()>,
 }
 
@@ -161,49 +170,95 @@ impl Drop for Redecryptor {
 }
 
 impl Redecryptor {
-    pub fn new(client: Client, cache: Weak<EventCacheInner>) -> Self {
+    pub(super) fn new(cache: Weak<EventCacheInner>) -> Self {
+        let (request_decryption_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let task = spawn(async {
-            let stream = {
-                let machine = client.olm_machine().await;
-                machine.as_ref().unwrap().store().room_keys_received_stream()
-            };
+            let request_redecryption_stream = UnboundedReceiverStream::new(receiver);
 
-            drop(client);
-
-            Self::listen_for_room_keys_task(cache, stream).await;
+            Self::listen_for_room_keys_task(cache, request_redecryption_stream).await;
         });
 
-        Self { task }
+        Self { task, request_decryption_sender }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn request_decryption(&self, request: DecryptionRetryRequest) {
+        let _ = self.request_decryption_sender.send(request).inspect_err(|_| {
+            warn!("Requesting a decryption while the redecryption task has been shut down")
+        });
+    }
+
+    async fn subscribe_to_room_key_stream(
+        cache: &Weak<EventCacheInner>,
+    ) -> Option<impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>>> {
+        let event_cache = cache.upgrade()?;
+        let client = event_cache.client().ok()?;
+        let machine = client.olm_machine().await;
+
+        machine.as_ref().map(|m| m.store().room_keys_received_stream())
+    }
+
+    async fn listen_loop(
+        cache: &Weak<EventCacheInner>,
+        decryption_request_stream: &mut Pin<&mut impl Stream<Item = DecryptionRetryRequest>>,
+    ) -> bool {
+        let Some(room_key_stream) = Self::subscribe_to_room_key_stream(cache).await else {
+            return false;
+        };
+
+        pin_mut!(room_key_stream);
+
+        // TODO: Listen to notifications that the Olm machine got recreated, this means
+        // that our room key stream is effectively dead, we need to exit this
+        // function with a `true` return value.
+        loop {
+            tokio::select! {
+                Some(request) = decryption_request_stream.next() => {
+                        let Some(event_cache) = cache.upgrade() else {
+                            break false;
+                        };
+
+                        let cache = EventCache { inner: event_cache };
+
+                        for session_id in request.session_ids {
+                            let _ = cache
+                                .retry_decryption(&request.room_id, &session_id)
+                                .await
+                                .inspect_err(|e| warn!("Error redecrypting {e:?}"));
+                        }
+                }
+                Some(room_keys) = room_key_stream.next() => {
+                    if let Ok(room_keys) = room_keys {
+                        let Some(event_cache) = cache.upgrade() else {
+                            break false;
+                        };
+
+                        let cache = EventCache { inner: event_cache };
+
+                        for key in room_keys {
+                            let _ = cache
+                                .retry_decryption(&key.room_id, &key.session_id)
+                                .await
+                                .inspect_err(|e| warn!("Error redecrypting {e:?}"));
+                        }
+                    } else {
+                        todo!("Decrypt all events?");
+                    }
+                }
+                else => break false,
+            }
+        }
     }
 
     async fn listen_for_room_keys_task(
         cache: Weak<EventCacheInner>,
-        received_stream: impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>>,
+        decryption_request_stream: UnboundedReceiverStream<DecryptionRetryRequest>,
     ) {
-        pin_mut!(received_stream);
+        pin_mut!(decryption_request_stream);
 
         // TODO: We need to relisten to this stream if it dies due to the cross-process
         // lock reloading the Olm machine.
-        while let Some(update) = received_stream.next().await {
-            if let Ok(room_keys) = update {
-                let Some(event_cache) = cache.upgrade() else {
-                    break;
-                };
-
-                let cache = EventCache { inner: event_cache };
-
-                for key in room_keys {
-                    let _ = cache
-                        .retry_decryption(key)
-                        .await
-                        .inspect_err(|e| warn!("Error redecrypting {e:?}"));
-                }
-            } else {
-                todo!("Redecrypt all visible events?")
-            }
-        }
-
-        info!("Shutting down the event cache redecryptor");
+        while Self::listen_loop(&cache, &mut decryption_request_stream).await {}
     }
 }
 
