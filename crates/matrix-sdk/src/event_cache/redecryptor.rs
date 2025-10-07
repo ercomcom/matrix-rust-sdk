@@ -30,22 +30,23 @@
 //! and Rd won't get notified about it. To work around this decryption requests
 //! can be explicitly sent to Rd.
 //!
+//!
 //!                              ┌─────────────┐
 //!                              │             │
-//!                  ┌───────────┤  Timeline   │
-//!                  │           │             │
-//!                  │           └─────▲───────┘
-//!                  │                 │
-//!                  │                 │
-//!                  │                 │
-//!              Decryption            │
-//!                request             │
-//!                  │       RoomEventCacheUpdates
-//!                  │                 │
-//!                  │                 │
-//!                  │      ┌──────────┴────────────┐
-//!                  │      │                       │
-//!                  └──────►      Redecryptor      │
+//!                  ┌───────────┤  Timeline   │◄────────────┐
+//!                  │           │             │             │
+//!                  │           └─────▲───────┘             │
+//!                  │                 │                     │
+//!                  │                 │                     │
+//!                  │                 │                     │
+//!              Decryption            │                 Redecryptor
+//!                request             │                   report
+//!                  │       RoomEventCacheUpdates           │         
+//!                  │                 │                     │
+//!                  │                 │                     │
+//!                  │      ┌──────────┴────────────┐        │
+//!                  │      │                       │        │
+//!                  └──────►      Redecryptor      │────────┘
 //!                         │                       │
 //!                         └───────────▲───────────┘
 //!                                     │
