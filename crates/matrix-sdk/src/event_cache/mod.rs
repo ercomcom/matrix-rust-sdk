@@ -69,16 +69,18 @@ use tracing::{Instrument as _, Span, debug, error, info, info_span, instrument, 
 use crate::{
     Client,
     client::WeakClient,
-    event_cache::redecryptor::Redecryptor,
     send_queue::{LocalEchoContent, RoomSendQueueUpdate, SendQueueUpdate},
 };
 
 mod deduplicator;
 mod pagination;
+#[cfg(feature = "e2e-encryption")]
 mod redecryptor;
 mod room;
 
 pub use pagination::{RoomPagination, RoomPaginationStatus};
+#[cfg(feature = "e2e-encryption")]
+pub use redecryptor::{DecryptionRetryRequest, RedecryptorReport};
 pub use room::{RoomEventCache, RoomEventCacheSubscriber, ThreadEventCacheUpdate};
 
 /// An error observed in the [`EventCache`].
@@ -152,7 +154,8 @@ pub struct EventCacheDropHandles {
     auto_shrink_linked_chunk_task: JoinHandle<()>,
 
     /// The task used to automatically redecrypt UTDs.
-    redecryptor: Redecryptor,
+    #[cfg(feature = "e2e-encryption")]
+    _redecryptor: redecryptor::Redecryptor,
 }
 
 impl fmt::Debug for EventCacheDropHandles {
@@ -205,6 +208,9 @@ impl EventCache {
             linked_chunk_update_sender.clone(),
         )));
 
+        #[cfg(feature = "e2e-encryption")]
+        let redecryption_channels = redecryptor::RedecryptorChannels::new();
+
         Self {
             inner: Arc::new(EventCacheInner {
                 client,
@@ -218,6 +224,8 @@ impl EventCache {
                 _thread_subscriber_task: thread_subscriber_task,
                 #[cfg(feature = "experimental-search")]
                 _search_indexing_task: search_indexing_task,
+                #[cfg(feature = "e2e-encryption")]
+                redecryption_channels,
                 thread_subscriber_receiver,
             }),
         }
@@ -262,13 +270,25 @@ impl EventCache {
                 auto_shrink_receiver,
             ));
 
-            let redecryptor = Redecryptor::new(Arc::downgrade(&self.inner));
+            #[cfg(feature = "e2e-encryption")]
+            let redecryptor = {
+                let receiver = self
+                    .inner
+                    .redecryption_channels
+                    .decryption_request_receiver
+                    .lock()
+                    .take()
+                    .expect("We should have initialized the channel an subscribing should happen only once");
+
+                redecryptor::Redecryptor::new(Arc::downgrade(&self.inner), receiver)
+            };
 
             Arc::new(EventCacheDropHandles {
                 listen_updates_task,
                 ignore_user_list_update_task,
                 auto_shrink_linked_chunk_task,
-                redecryptor,
+                #[cfg(feature = "e2e-encryption")]
+                _redecryptor: redecryptor,
             })
         });
 
@@ -848,6 +868,9 @@ struct EventCacheInner {
     /// This is helpful for tests to coordinate that a new thread subscription
     /// has been sent or not.
     thread_subscriber_receiver: Receiver<()>,
+
+    #[cfg(feature = "e2e-encryption")]
+    redecryption_channels: redecryptor::RedecryptorChannels,
 }
 
 type AutoShrinkChannelPayload = OwnedRoomId;
