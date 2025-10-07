@@ -26,12 +26,13 @@ use matrix_sdk::{
     crypto::store::types::RoomKeyInfo,
     deserialized_responses::TimelineEventKind as SdkTimelineEventKind,
     encryption::backups::BackupState,
+    event_cache::{self, RedecryptorReport},
     event_handler::EventHandlerHandle,
     executor::{JoinHandle, spawn},
 };
 use tokio::sync::{
     RwLock,
-    mpsc::{self, Receiver, Sender},
+    mpsc::{self, Receiver, Sender, UnboundedSender},
 };
 use tokio_stream::{StreamExt as _, wrappers::errors::BroadcastStreamRecvError};
 use tracing::{Instrument as _, debug, error, field, info, info_span, warn};
@@ -66,6 +67,58 @@ impl Drop for CryptoDropHandles {
         self.room_keys_received_join_handle.abort();
         self.room_key_backup_enabled_join_handle.abort();
         self.encryption_changes_handle.abort();
+    }
+}
+
+async fn redecryption_report_task(
+    stream: impl Stream<Item = Result<RedecryptorReport, BroadcastStreamRecvError>>,
+    timeline_controller: TimelineController,
+    sender: UnboundedSender<event_cache::DecryptionRetryRequest>,
+) {
+    pin_mut!(stream);
+
+    while let Some(report) = stream.next().await {
+        match report {
+            Ok(RedecryptorReport::ResolvedUtds { events, .. }) => {
+                let state = timeline_controller.state.read().await;
+
+                if let Some(utd_hook) = &state.meta.unable_to_decrypt_hook {
+                    for event_id in events {
+                        utd_hook.on_late_decrypt(&event_id).await;
+                    }
+                }
+            }
+            Ok(RedecryptorReport::Lagging) | Err(_) => {
+                // The room key stream lagged or the OlmMachine got regenerated. Let's tell the
+                // redecryptor which events we have.
+                let state = timeline_controller.state.read().await;
+
+                let (utds, decrypted): (BTreeSet<_>, BTreeSet<_>) = state
+                    .items
+                    .iter()
+                    .filter_map(|event| {
+                        event.as_event().and_then(|e| {
+                            let session_id = e.encryption_info().and_then(|info| info.session_id());
+                            session_id.map(|id| id.to_owned()).zip(Some(e))
+                        })
+                    })
+                    .partition_map(|(session_id, event)| {
+                        if event.content.is_unable_to_decrypt() {
+                            Either::Left(session_id)
+                        } else {
+                            Either::Right(session_id)
+                        }
+                    });
+
+                let message = event_cache::DecryptionRetryRequest {
+                    room_id: timeline_controller.room().room_id().to_owned(),
+                    utd_session_ids: utds,
+                    refresh_info_session_ids: decrypted,
+                };
+
+                let _ = sender.send(message);
+            }
+        }
     }
 }
 
